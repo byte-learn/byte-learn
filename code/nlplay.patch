@@ -1,0 +1,445 @@
+diff --git a/nlplay/models/pytorch/classifiers/dpcnn.py b/nlplay/models/pytorch/classifiers/dpcnn.py
+index 3b7d7aa..59344f6 100644
+--- a/nlplay/models/pytorch/classifiers/dpcnn.py
++++ b/nlplay/models/pytorch/classifiers/dpcnn.py
+@@ -24,6 +24,7 @@ class DPCNN(nn.Module):
+         update_embedding: bool = True,
+         pad_index: int = 0,
+         apply_sm: bool = True,
++        one_by_one: bool = False
+     ):
+         super(DPCNN, self).__init__()
+ 
+@@ -33,6 +34,7 @@ class DPCNN(nn.Module):
+         self.embedding_size = embedding_size
+         self.pretrained_vec = pretrained_vec
+         self.update_embedding = update_embedding
++        self.one_by_one = one_by_one
+ 
+         self.embedding = nn.Embedding(
+             self.vocabulary_size, self.embedding_size, padding_idx=pad_index
+@@ -99,6 +101,8 @@ class DPCNN(nn.Module):
+         doc_embedding = F.max_pool1d(conv_features, conv_features.size(2)).squeeze()
+ 
+         out = self.dropout(self.fc1(doc_embedding))
++        if self.one_by_one:
++            out = out.reshape((1,2))
+         if self.apply_sm:
+             out = F.log_softmax(out, dim=1)
+ 
+diff --git a/nlplay/models/pytorch/metrics.py b/nlplay/models/pytorch/metrics.py
+index b98f033..37fb5d6 100644
+--- a/nlplay/models/pytorch/metrics.py
++++ b/nlplay/models/pytorch/metrics.py
+@@ -1,11 +1,19 @@
+ import numpy as np
+ import torch
+ from torch import nn
++import torch.nn.functional as F
++
++
++from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, roc_curve, auc
+ 
+ 
+ def compute_accuracy(model, data_loader, device):
+     correct_pred = 0
+     num_examples = 0
++    m_performance = np.array([0,0,0])
++    y_prob_true, y_prob_false, y_test = list(), list(), list()
++    num_it = 0
++    
+     # Loop across different batches
+     for i, (features, targets) in enumerate(data_loader):
+         # Send data to target device
+@@ -17,7 +25,25 @@ def compute_accuracy(model, data_loader, device):
+ 
+         # Get predictions from the maximum returned values
+         _, predicted_labels = torch.max(out.data, 1)
++        y_prob_true.extend(F.softmax(out.data, 1)[:,1].tolist())
++        y_prob_false.extend(F.softmax(out.data, 1)[:,0].tolist())
++        
+         num_examples += targets.size(0)
+         correct_pred += (predicted_labels == targets).sum()
+ 
+-    return correct_pred.float() / num_examples
+\ No newline at end of file
++        targets = targets.to('cpu')
++        predicted_labels = predicted_labels.to('cpu')
++        prf = precision_recall_fscore_support(targets, predicted_labels, average='binary')
++        y_test.extend(targets.tolist())
++
++        m_performance = np.add(m_performance, np.array(prf[:3]))
++        num_it += 1
++        # targets = targets.to(device)
++    
++    m_performance = np.divide(m_performance, num_it)
++
++    # y_prob = y_prob.to('cpu')
++    fpr, tpr, threshold = roc_curve(y_test, y_prob_true) 
++    roc_auc = auc(fpr, tpr)
++
++    return correct_pred.float() / num_examples, m_performance, {"fpr": fpr.tolist(), "tpr": tpr.tolist(), "roc_auc": roc_auc.tolist(), "pred_prob": [y_prob_false, y_prob_true], "threshold": threshold.tolist()} 
+\ No newline at end of file
+diff --git a/nlplay/models/pytorch/trainer.py b/nlplay/models/pytorch/trainer.py
+index 50a8877..d937084 100644
+--- a/nlplay/models/pytorch/trainer.py
++++ b/nlplay/models/pytorch/trainer.py
+@@ -2,6 +2,7 @@ import logging
+ import os
+ import time
+ import torch
++import json
+ import numpy as np
+ from datetime import datetime
+ from pathlib import Path
+@@ -39,6 +40,9 @@ class PytorchModelTrainer(object):
+         use_mixed_precision: bool = False,
+         apex_opt_level: str = "O0",
+         log_interval: int = 50,
++        cuda_device: str = "cuda",
++        parallel: str = False,
++        device_ids: list = [0,1,2]
+     ):
+ 
+         self.model = model
+@@ -68,6 +72,10 @@ class PytorchModelTrainer(object):
+         self.checkpoint_file_suffix = checkpoint_file_suffix
+         self.max_grad_clip_norm = max_grad_clip_norm
+         self.log_interval = log_interval
++        self.cuda_device = cuda_device
++        self.plot_data = dict()
++        self.parallel = parallel
++        self.device_ids = device_ids
+ 
+         if use_mixed_precision:
+             if APEX_AVAILABLE and torch.cuda.is_available():
+@@ -83,13 +91,13 @@ class PytorchModelTrainer(object):
+ 
+         logging.getLogger(__name__)
+ 
+-    def train_evaluate(self, seed=42, check_dl=True, run_lr_finder=False,         show_lr_plot: bool = False,):
++    def train_evaluate(self, seed=42, check_dl=True, run_lr_finder=False,         show_lr_plot: bool = False):
+ 
+         set_seed(seed)
+-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++        device = torch.device(self.cuda_device if torch.cuda.is_available() else "cpu")
+ 
+         self.train_dl = DataLoader(
+-            self.train_ds, batch_size=self.batch_size, shuffle=True
++            self.train_ds, batch_size=self.batch_size, shuffle=False
+         )
+         if self.test_ds is not None:
+             self.test_dl = DataLoader(
+@@ -100,8 +108,15 @@ class PytorchModelTrainer(object):
+                 self.val_ds, batch_size=self.batch_size, shuffle=False
+             )
+ 
+-        self.model = self.model.to(device)
+-        self.criterion = self.criterion.to(device)
++        if not self.parallel:
++            self.model = self.model.to(device)
++            self.criterion = self.criterion.to(device)
++        else:
++            logging.info("Running on multi GPU ...")
++            self.model = torch.nn.DataParallel(self.model, device_ids = self.device_ids)
++            self.model = self.model.to(f'cuda:{self.model.device_ids[0]}')
++            self.criterion = self.criterion.to(f'cuda:{self.model.device_ids[0]}')
++
+ 
+         if run_lr_finder:
+             logging.info("LR Finder Running....")
+@@ -149,6 +164,7 @@ class PytorchModelTrainer(object):
+         # Loop over epochs
+         start_time = time.time()
+         for epoch in range(self.n_epochs):
++            self.plot_data[epoch+1] = {"loss": list(), "train_acc": 0, "test_acc": 0}
+             train_losses = []
+             losses = []
+             epoch_start_time = time.time()
+@@ -158,8 +174,12 @@ class PytorchModelTrainer(object):
+             ):
+ 
+                 # transfer data to target device
+-                batch_train_data = batch_train_data.to(device)
+-                batch_train_labels = batch_train_labels.to(device)
++                if not self.parallel:
++                    batch_train_data = batch_train_data.to(device)
++                    batch_train_labels = batch_train_labels.to(device)
++                else: 
++                    batch_train_data = batch_train_data.to(f'cuda:{self.model.device_ids[0]}')
++                    batch_train_labels = batch_train_labels.to(f'cuda:{self.model.device_ids[0]}')
+ 
+                 # zero the parameter gradients
+                 self.optimizer.zero_grad()
+@@ -170,6 +190,7 @@ class PytorchModelTrainer(object):
+                 # Store loss values
+                 self.all_train_loss_hist.append(loss.item())
+                 losses.append(loss.item())
++                self.plot_data[epoch+1]["loss"].append(loss.item())
+ 
+                 # Computes gradient
+                 if self.apex:
+@@ -204,19 +225,22 @@ class PytorchModelTrainer(object):
+             # End of epoch - Evaluate the model performance
+             self.model.eval()
+             with torch.set_grad_enabled(False):  # save memory during inference
++                train_acc, m_performance, additional_data = compute_accuracy(self.model, self.train_dl, device=device)
+                 logging.info(
+                     "Epoch: %03d/%03d | Train Accuracy: %.6f"
+                     % (
+                         epoch + 1,
+                         self.n_epochs,
+-                        compute_accuracy(self.model, self.train_dl, device=device),
++                        train_acc,
+                     )
+                 )
+-                val_acc = compute_accuracy(self.model, self.val_dl, device=device)
++                logging.info("Epoch: %03d/%03d | Precision: %.6f | Recall: %.6f | F-1: %.6f"%(epoch +1, self.n_epochs, m_performance[0], m_performance[1], m_performance[2]))
++                val_acc, m_performance, additional_data = compute_accuracy(self.model, self.val_dl, device=device)
+                 logging.info(
+                     "Epoch: %03d/%03d | Val accuracy: %.6f"
+                     % (epoch + 1, self.n_epochs, val_acc)
+                 )
++                logging.info("Epoch: %03d/%03d | Precision: %.6f | Recall: %.6f | F-1: %.6f"%(epoch +1, self.n_epochs, m_performance[0], m_performance[1], m_performance[2]))
+                 logging.info(
+                     "Epoch: %03d/%03d | Epoch duration: %s"
+                     % (epoch + 1, self.n_epochs, get_elapsed_time(epoch_start_time))
+@@ -226,6 +250,14 @@ class PytorchModelTrainer(object):
+                     % (epoch + 1, self.n_epochs, get_elapsed_time(start_time))
+                 )
+ 
++                self.plot_data[epoch+1]["train_acc"] = train_acc.item()
++                self.plot_data[epoch+1]["test_acc"] = val_acc.item()
++                self.plot_data[epoch+1]["fpr"] = additional_data["fpr"] 
++                self.plot_data[epoch+1]["tpr"] = additional_data["tpr"] 
++                self.plot_data[epoch+1]["roc_auc"] = additional_data["roc_auc"] 
++                self.plot_data[epoch+1]["pred_prob"] = additional_data["pred_prob"] 
++                self.plot_data[epoch+1]["threshold"] = additional_data["threshold"] 
++
+                 # early stopping & checkpoint
+                 current_score = val_acc
+                 if self.best_score is None:
+@@ -247,6 +279,7 @@ class PytorchModelTrainer(object):
+                 else:
+                     self.best_score = current_score
+                     self.best_epoch = epoch + 1
++                    self.plot_data["best_epoch"] = self.best_epoch
+                     self.save_checkpoint()
+                     self.es_counter = 0
+ 
+@@ -267,6 +300,10 @@ class PytorchModelTrainer(object):
+     def save_checkpoint(self):
+         """Saves model when validation loss decreases."""
+         f_name = "checkpoint_{}.pt".format(self.checkpoint_file_suffix)
++        g_name = "plot_data_{}.json".format(self.checkpoint_file_suffix)
++        
++        with open(g_name, 'w') as g:
++            json.dump(self.plot_data, g)
+ 
+         if self.apex:
+             checkpoint = {
+diff --git a/scripts/dpcnn_train_script.py b/scripts/dpcnn_train_script.py
+index c564dfd..48fd53e 100644
+--- a/scripts/dpcnn_train_script.py
++++ b/scripts/dpcnn_train_script.py
+@@ -1,60 +1,162 @@
+ import logging
+ import torch
++import numpy as np
+ from torch import nn
+-from nlplay.data.cache import WordVectorsManager, WV, DSManager, DS
+-from nlplay.features.text_cleaner import kimyoon_text_cleaner
+ from nlplay.models.pytorch.classifiers.dpcnn import DPCNN
+-from nlplay.models.pytorch.dataset import DSGenerator
+ from nlplay.models.pytorch.pretrained import get_pretrained_vecs
+ from nlplay.models.pytorch.trainer import PytorchModelTrainer
+ 
++import json
++from torch.utils.data import IterableDataset
++import random
++from keras_preprocessing import sequence
++import os
++import warnings
++
++warnings.filterwarnings('ignore')
++
++multi_gpu = False 
++
++if multi_gpu:
++    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"
++
++device_ids = [0,1,2]
++
+ logging.basicConfig(format='%(asctime)s %(message)s', level=logging.DEBUG, datefmt="%Y-%m-%d %H:%M:%S")
+ 
+-# Input data files
+-ds = DSManager(DS.IMDB.value)
+-train_csv, test_csv, val_csv = ds.get_partition_paths()
+-lm = WordVectorsManager(WV.GLOVE_EN6B_100.value)
+-pretrained_vec = lm.get_wv_path()
++seed = 25 
++random.seed(seed)
++np.random.seed(seed)
++torch.manual_seed(seed)
++torch.cuda.manual_seed(seed)
++torch.cuda.manual_seed_all(seed)
++torch.backends.cudnn.benchmark = False
++torch.backends.cudnn.deterministic = True
++
++method = "fasttext"
++# method = "word2vec"
+ 
+-# Model Parameters
+ num_epochs = 20
+-batch_size = 128
+-ngram_range = (1, 1)
+-max_features = 15000
+-max_seq = 600
++batch_size = 64
++max_seq = 280000 
++k_size = 51 
++stride = 15 
++cuda_device = "cuda:0"
++
+ embedding_size = 100
+ dropout = 0.2
++#lr = 0.0005 0.001 0.0015 0.002
+ lr = 0.00075
+-num_workers = 1
++num_workers = 10
++min_seq = 0
++
++suffix = f"dpcnn-{method}-{max_seq}"
++print(f"Kernel size: {k_size}, pooling stride: {stride}, max seq: {max_seq}, on {cuda_device}")
++
++train_csv = f"/path/to/train.csv"
++test_csv = f"/path/to/test.csv"
++pretrained_vec = f"/path/to/w2v.embeddings"
++target_vocab_file = f"/path/to/target_vocab.json"
++
++with open(target_vocab_file, 'r') as f:
++    vocab = json.load(f)
++
++vecs = get_pretrained_vecs(input_vec_file=pretrained_vec, target_vocab=vocab, dim=embedding_size, output_file=None)
++### Add a row of zeros to the end of embedding. We use this index (-1) for padding 
++row_len = len(vecs[0])
++vecs = np.concatenate((vecs, [np.zeros(row_len)]))
++### +1 because of the added zeros row at the end
++vocab_size = len(vocab) + 1
++pad_index = vocab_size - 1
++
++def file_len(fname):
++    j = 0
++    with open(fname, 'r') as f:
++        for i, l in enumerate(f):
++            if len(l.split('\t')[4].split()) <  min_seq:
++                j += 1
++            pass
++    return i - j + 1 
++
++length = {'train': file_len(train_csv), 'test': file_len(test_csv)}
++logging.info(f"Train samples: {length['train']}, Test samples: {length['test']}")
++
++class CustomIterableDataset(IterableDataset):
++    def __init__(self, filename):
++        self.file = filename
++        self.length = length['train'] if self.file == train_csv else length['test']
++    
++    def parse_file(self):
++        with open(self.file, 'r') as f:
++            for ix, line in enumerate(f):
++                # rank, hostname, main_url, script_url, bytecode, label
++                temp_line = line.strip().split('\t')
++                bytecode = temp_line[4].split()
++                label = temp_line[-1].strip()
++                if len(bytecode) < min_seq:
++                    continue
++                X = np.array(bytecode[:max_seq], dtype=int)
++                # vocab_size - 1 is the last item's index in pretrained vec which is a row of zeros
++                X = sequence.pad_sequences([X], maxlen=max_seq, padding='post', value=pad_index)
++                X = torch.tensor(X[0], dtype=torch.long)
++                y = torch.tensor(np.array(label, dtype=int), dtype=torch.long)
++
++                yield X, y
++
++    def __len__(self):
++        return self.length 
++
++    def __iter__(self):
++        return self.parse_file()
++
++# Shuffling an iterable dataset  https://discuss.pytorch.org/t/how-to-shuffle-an-iterable-dataset/64130/4
++class ShuffleDataset(IterableDataset):
++    def __init__(self, dataset, buffer_size, data_type):
++        super().__init__()
++        self.dataset = dataset
++        self.buffer_size = buffer_size
++        self.length = length['train'] if data_type == train_csv else length['test']
++
++    def __len__(self):
++        return self.length
+ 
++    def __iter__(self):
++        shufbuf = []
++        try:
++            dataset_iter = iter(self.dataset)
++            for i in range(self.buffer_size):
++                shufbuf.append(next(dataset_iter))
++        except:
++            self.buffer_size = len(shufbuf)
+ 
+-# Data preparation
+-ds = DSGenerator()
+-train_ds, val_ds = ds.from_csv(train_file=train_csv, val_file=test_csv, ngram_range=ngram_range,
+-                               max_features=max_features, preprocess_func=kimyoon_text_cleaner, preprocess_ncore=3,
+-                               ds_max_seq=max_seq)
+-vecs = get_pretrained_vecs(input_vec_file=pretrained_vec, target_vocab=ds.vocab,
+-                           dim=embedding_size, output_file=None)
++        try:
++            while True:
++                try:
++                    item = next(dataset_iter)
++                    idx = random.randint(0, self.buffer_size - 1)
++                    yield shufbuf[idx]
++                    shufbuf[idx] = item
++                except StopIteration:
++                    break
++            while len(shufbuf) > 0:
++                yield shufbuf.pop()
++        except GeneratorExit:
++            pass
+ 
+-model = DPCNN(vocabulary_size=len(ds.vocab), num_classes=ds.num_classes, embedding_size=embedding_size,)
++train_ds = CustomIterableDataset(train_csv)
++train_ds = ShuffleDataset(train_ds, 4096, train_csv)
++val_ds = CustomIterableDataset(test_csv)
++val_ds = ShuffleDataset(val_ds, 4096, test_csv)
+ 
++model = DPCNN(vocabulary_size=vocab_size, num_classes=2, embedding_size=embedding_size, pretrained_vec=vecs, kernel_size=k_size, pooling_stride=stride, pad_index=pad_index)
+ criterion = nn.NLLLoss()
+ optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+ trainer = PytorchModelTrainer(model, criterion, optimizer,
+                               train_ds=train_ds, val_ds=val_ds,
+-                              batch_size=batch_size, n_workers=num_workers, epochs=num_epochs,)
+-trainer.train_evaluate()
+-
+-# 2020-10-17 15:42:29 Epoch: 010/020 | Train Accuracy: 0.994400
+-# 2020-10-17 15:42:30 Epoch: 010/020 | Val accuracy: 0.824760
+-# 2020-10-17 15:42:30 Time elapsed: 1m 9s
+-# 2020-10-17 15:42:30 EarlyStopping patience counter: 3 out of 3
+-# 2020-10-17 15:42:30 /!\ Early stopping model training /!\
+-# 2020-10-17 15:42:30 ------------------------------------------
+-# 2020-10-17 15:42:30 ---              SUMMARY               ---
+-# 2020-10-17 15:42:30 ------------------------------------------
+-# 2020-10-17 15:42:30 Number of model parameters : 1509954
+-# 2020-10-17 15:42:30 Total Training Time: 1m 9s
+-# 2020-10-17 15:42:30 Total Time: 1m 9s
+-# 2020-10-17 15:42:30 Best Epoch: 7 - Accuracy Score: 0.826280
+-# 2020-10-17 15:42:30 ------------------------------------------
++                              batch_size=batch_size, n_workers=num_workers, 
++                              epochs=num_epochs,checkpoint_file_suffix=f"{str(max_seq)}_{str(k_size)}_{str(stride)}_{suffix}", 
++                              cuda_device=cuda_device, 
++                              parallel=multi_gpu,
++                              device_ids=device_ids
++                              )
++trainer.train_evaluate(seed=seed)
