@@ -1,0 +1,254 @@
+diff --git a/src/interpreter/bytecode-decoder.cc b/src/interpreter/bytecode-decoder.cc
+index f2959b8326..c44c1e7d1e 100644
+--- a/src/interpreter/bytecode-decoder.cc
++++ b/src/interpreter/bytecode-decoder.cc
+@@ -73,21 +73,6 @@ uint32_t BytecodeDecoder::DecodeUnsignedOperand(Address operand_start,
+ 
+ namespace {
+ 
+-const char* NameForRuntimeId(Runtime::FunctionId idx) {
+-  return Runtime::FunctionForId(idx)->name;
+-}
+-
+-const char* NameForNativeContextIndex(uint32_t idx) {
+-  switch (idx) {
+-#define CASE(index_name, type, name) \
+-  case Context::index_name:          \
+-    return #name;
+-    NATIVE_CONTEXT_FIELDS(CASE)
+-#undef CASE
+-    default:
+-      UNREACHABLE();
+-  }
+-}
+ 
+ }  // anonymous namespace
+ 
+@@ -95,123 +80,19 @@ const char* NameForNativeContextIndex(uint32_t idx) {
+ std::ostream& BytecodeDecoder::Decode(std::ostream& os,
+                                       const uint8_t* bytecode_start) {
+   Bytecode bytecode = Bytecodes::FromByte(bytecode_start[0]);
+-  int prefix_offset = 0;
+   OperandScale operand_scale = OperandScale::kSingle;
+   if (Bytecodes::IsPrefixScalingBytecode(bytecode)) {
+-    prefix_offset = 1;
+     operand_scale = Bytecodes::PrefixBytecodeToOperandScale(bytecode);
+     bytecode = Bytecodes::FromByte(bytecode_start[1]);
+   }
+ 
+   // Prepare to print bytecode and operands as hex digits.
+-  std::ios saved_format(nullptr);
+-  saved_format.copyfmt(saved_format);
+-  os.fill('0');
+-  os.flags(std::ios::hex);
+-
+-  int bytecode_size = Bytecodes::Size(bytecode, operand_scale);
+-  for (int i = 0; i < prefix_offset + bytecode_size; i++) {
+-    os << std::setw(2) << static_cast<uint32_t>(bytecode_start[i]) << ' ';
+-  }
+-  os.copyfmt(saved_format);
+-
+-  const int kBytecodeColumnSize = 6;
+-  for (int i = prefix_offset + bytecode_size; i < kBytecodeColumnSize; i++) {
+-    os << "   ";
+-  }
+ 
+-  os << Bytecodes::ToString(bytecode, operand_scale) << " ";
++  os << Bytecodes::ToString(bytecode, operand_scale) << ",";
+ 
+   // Operands for the debug break are from the original instruction.
+   if (Bytecodes::IsDebugBreak(bytecode)) return os;
+ 
+-  int number_of_operands = Bytecodes::NumberOfOperands(bytecode);
+-  for (int i = 0; i < number_of_operands; i++) {
+-    OperandType op_type = Bytecodes::GetOperandType(bytecode, i);
+-    int operand_offset =
+-        Bytecodes::GetOperandOffset(bytecode, i, operand_scale);
+-    Address operand_start = reinterpret_cast<Address>(
+-        &bytecode_start[prefix_offset + operand_offset]);
+-    switch (op_type) {
+-      case interpreter::OperandType::kIdx:
+-      case interpreter::OperandType::kUImm:
+-        os << "["
+-           << DecodeUnsignedOperand(operand_start, op_type, operand_scale)
+-           << "]";
+-        break;
+-      case interpreter::OperandType::kIntrinsicId: {
+-        auto id = static_cast<IntrinsicsHelper::IntrinsicId>(
+-            DecodeUnsignedOperand(operand_start, op_type, operand_scale));
+-        os << "[" << NameForRuntimeId(IntrinsicsHelper::ToRuntimeId(id)) << "]";
+-        break;
+-      }
+-      case interpreter::OperandType::kNativeContextIndex: {
+-        auto id = DecodeUnsignedOperand(operand_start, op_type, operand_scale);
+-        os << "[" << NameForNativeContextIndex(id) << "]";
+-        break;
+-      }
+-      case interpreter::OperandType::kRuntimeId:
+-        os << "["
+-           << NameForRuntimeId(static_cast<Runtime::FunctionId>(
+-                  DecodeUnsignedOperand(operand_start, op_type, operand_scale)))
+-           << "]";
+-        break;
+-      case interpreter::OperandType::kImm:
+-        os << "[" << DecodeSignedOperand(operand_start, op_type, operand_scale)
+-           << "]";
+-        break;
+-      case interpreter::OperandType::kFlag8:
+-        os << "#"
+-           << DecodeUnsignedOperand(operand_start, op_type, operand_scale);
+-        break;
+-      case interpreter::OperandType::kReg:
+-      case interpreter::OperandType::kRegOut: {
+-        Register reg =
+-            DecodeRegisterOperand(operand_start, op_type, operand_scale);
+-        os << reg.ToString();
+-        break;
+-      }
+-      case interpreter::OperandType::kRegOutTriple: {
+-        RegisterList reg_list =
+-            DecodeRegisterListOperand(operand_start, 3, op_type, operand_scale);
+-        os << reg_list.first_register().ToString() << "-"
+-           << reg_list.last_register().ToString();
+-        break;
+-      }
+-      case interpreter::OperandType::kRegOutPair:
+-      case interpreter::OperandType::kRegPair: {
+-        RegisterList reg_list =
+-            DecodeRegisterListOperand(operand_start, 2, op_type, operand_scale);
+-        os << reg_list.first_register().ToString() << "-"
+-           << reg_list.last_register().ToString();
+-        break;
+-      }
+-      case interpreter::OperandType::kRegOutList:
+-      case interpreter::OperandType::kRegList: {
+-        DCHECK_LT(i, number_of_operands - 1);
+-        DCHECK_EQ(Bytecodes::GetOperandType(bytecode, i + 1),
+-                  OperandType::kRegCount);
+-        int reg_count_offset =
+-            Bytecodes::GetOperandOffset(bytecode, i + 1, operand_scale);
+-        Address reg_count_operand = reinterpret_cast<Address>(
+-            &bytecode_start[prefix_offset + reg_count_offset]);
+-        uint32_t count = DecodeUnsignedOperand(
+-            reg_count_operand, OperandType::kRegCount, operand_scale);
+-        RegisterList reg_list = DecodeRegisterListOperand(
+-            operand_start, count, op_type, operand_scale);
+-        os << reg_list.first_register().ToString() << "-"
+-           << reg_list.last_register().ToString();
+-        i++;  // Skip kRegCount.
+-        break;
+-      }
+-      case interpreter::OperandType::kNone:
+-      case interpreter::OperandType::kRegCount:  // Dealt with in kRegList.
+-        UNREACHABLE();
+-    }
+-    if (i != number_of_operands - 1) {
+-      os << ", ";
+-    }
+-  }
+   return os;
+ }
+ 
+diff --git a/src/interpreter/interpreter.cc b/src/interpreter/interpreter.cc
+index b9ccae9a26..fee64c3503 100644
+--- a/src/interpreter/interpreter.cc
++++ b/src/interpreter/interpreter.cc
+@@ -293,6 +293,48 @@ InterpreterCompilationJob::Status InterpreterCompilationJob::DoFinalizeJobImpl(
+        << shared_info << ")]" << std::endl;
+     os << "Bytecode length: " << bytecodes->length() << std::endl;
+     bytecodes->Disassemble(os);
++    /**************** ByteLearn BEGIN ****************/
++    os << "ByteLearn[Source][Start]" << std::endl;
++    os << SourceCodeOf(*shared_info) << std::endl;
++    os << "ByteLearn[Source][End]" << std::endl;
++    os << "ByteLearn[URL]: ";
++    
++    bool found_url = false;
++    Script s = Script::cast(shared_info->script());
++    if (s.has_eval_from_shared()) { // eval
++      s = Script::cast(s.eval_from_shared().script());
++    }
++    if (s.GetNameOrSourceURL().IsString()) { 
++      if (String::cast(s.GetNameOrSourceURL()).length() == 0) { // look from top of the stack
++        v8::Isolate* b_isolate = reinterpret_cast<v8::Isolate*>(isolate);
++        v8::Isolate::Scope isolate_scope(b_isolate);
++        v8::HandleScope handle_scope(b_isolate);
++        if (b_isolate != nullptr && b_isolate->InContext()) {
++          v8::Local<v8::StackTrace> stack_trace = v8::StackTrace::CurrentStackTrace(b_isolate, /*frame_limit=*/1);
++          if (!stack_trace.IsEmpty() && stack_trace->GetFrameCount() >= 1) {
++            Local<v8::String> local_script_name_or_url = stack_trace->CurrentScriptNameOrSourceURL(b_isolate);
++            if (!local_script_name_or_url.IsEmpty() && local_script_name_or_url->Length() != 0) {
++              v8::String::Utf8Value script_name_or_url(b_isolate, local_script_name_or_url);
++              if (script_name_or_url.length() != 0) {
++                found_url = true;
++                os << (*script_name_or_url);
++              }
++            }
++          }
++        } else if (s.host_defined_options().length() != 0) { 
++          found_url = true;
++          String::cast(s.host_defined_options().get(0)).PrintUC16(os);
++        }
++      } else { // normal
++        found_url = true;
++        String::cast(s.GetNameOrSourceURL()).PrintUC16(os);
++      }
++    }
++    if (!found_url) {
++      os << "No URL";
++    }
++    os << std::endl;
++    /**************** ByteLearn END ****************/
+     os << std::flush;
+   }
+ 
+diff --git a/src/objects/code.cc b/src/objects/code.cc
+index b745e4d199..5d3c82f691 100644
+--- a/src/objects/code.cc
++++ b/src/objects/code.cc
+@@ -634,42 +634,18 @@ void BytecodeArray::Disassemble(std::ostream& os) {
+   BytecodeArray handle_storage = *this;
+   Handle<BytecodeArray> handle(reinterpret_cast<Address*>(&handle_storage));
+   interpreter::BytecodeArrayIterator iterator(handle);
++  os << "[ByteLearn][Bytecode]:[";
+   while (!iterator.done()) {
+     if (!source_positions.done() &&
+         iterator.current_offset() == source_positions.code_offset()) {
+-      os << std::setw(5) << source_positions.source_position().ScriptOffset();
+-      os << (source_positions.is_statement() ? " S> " : " E> ");
+       source_positions.Advance();
+-    } else {
+-      os << "         ";
+-    }
++    } 
+     Address current_address = base_address + iterator.current_offset();
+-    os << reinterpret_cast<const void*>(current_address) << " @ "
+-       << std::setw(4) << iterator.current_offset() << " : ";
+     interpreter::BytecodeDecoder::Decode(
+         os, reinterpret_cast<byte*>(current_address));
+-    if (interpreter::Bytecodes::IsJump(iterator.current_bytecode())) {
+-      Address jump_target = base_address + iterator.GetJumpTargetOffset();
+-      os << " (" << reinterpret_cast<void*>(jump_target) << " @ "
+-         << iterator.GetJumpTargetOffset() << ")";
+-    }
+-    if (interpreter::Bytecodes::IsSwitch(iterator.current_bytecode())) {
+-      os << " {";
+-      bool first_entry = true;
+-      for (interpreter::JumpTableTargetOffset entry :
+-           iterator.GetJumpTableTargetOffsets()) {
+-        if (first_entry) {
+-          first_entry = false;
+-        } else {
+-          os << ",";
+-        }
+-        os << " " << entry.case_value << ": @" << entry.target_offset;
+-      }
+-      os << " }";
+-    }
+-    os << std::endl;
+     iterator.Advance();
+   }
++  os << "]" << std::endl;
+ 
+   os << "Constant pool (size = " << constant_pool().length() << ")\n";
+ #ifdef OBJECT_PRINT

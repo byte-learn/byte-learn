@@ -1,0 +1,7 @@
+fasttext @ git+https://github.com/facebookresearch/fastText.git@b64e359d5485dda4b4b5074494155d18e25c8d13
+gensim==4.3.0
+joblib
+Keras-Preprocessing
+numpy
+prettytable==3.8.0
+torch==1.13.1
